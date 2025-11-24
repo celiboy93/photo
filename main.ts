@@ -1,90 +1,39 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
-import { Image } from "https://deno.land/x/imagescript@1.2.9/mod.ts";
 
 const kv = await Deno.openKv();
-
-// --- SMART IMAGE PROCESSOR (Quality First, Resize Last) ---
-async function processImage(file: File): Promise<Uint8Array | null> {
-    try {
-        const buffer = await file.arrayBuffer();
-        let image = await Image.decode(new Uint8Array(buffer));
-        
-        // Deno KV Limit (Safe Margin)
-        const LIMIT = 63000; 
-        
-        // စမ်းသပ်မည့် Quality (မြင့်ရာမှ နိမ့်ရာသို့)
-        let quality = 80; 
-        let encoded = await image.encodeJPEG(quality);
-
-        // 64KB အောက်မရောက်မချင်း Loop ပတ်မယ်
-        while (encoded.length > LIMIT) {
-            // ၁။ Quality ကို အရင်လျှော့မယ် (User လိုချင်သလို Size မချုံ့ချင်လို့)
-            if (quality > 10) {
-                quality -= 10;
-                encoded = await image.encodeJPEG(quality);
-            } 
-            // ၂။ Quality က ၁၀% အောက်ရောက်သွားရင်တော့ ပုံက ကြည့်မကောင်းတော့ဘူး
-            // ဒါကြောင့် မတတ်သာတဲ့အဆုံး Size (Dimension) ကို ၁၀% စီ လျှော့မယ်
-            else {
-                image.resize(Math.floor(image.width * 0.9), Image.RESIZE_AUTO);
-                // Resize လုပ်ပြီးရင် Quality ပြန်တင်လို့ရပြီ (ကြည့်ကောင်းအောင်)
-                quality = 50; 
-                encoded = await image.encodeJPEG(quality);
-            }
-        }
-
-        return encoded;
-    } catch (e) {
-        console.error("Image Error:", e);
-        return null;
-    }
-}
 
 serve(async (req) => {
   const url = new URL(req.url);
 
-  // --- 1. UPLOAD ---
+  // --- 1. UPLOAD IMAGE ---
   if (req.method === "POST" && url.pathname === "/upload") {
-      const form = await req.formData();
-      const file = form.get("photo") as File;
-      
-      if (!file) return new Response("No file", { status: 400 });
-
-      // Smart Process လုပ်မယ်
-      const optimizedImage = await processImage(file);
-
-      if (optimizedImage) {
-          const id = Date.now().toString();
-          await kv.set(["gallery", id], optimizedImage);
-          return new Response(null, { status: 303, headers: { "Location": "/" } });
-      } else {
-          return new Response("Processing Failed (File too big or not an image)", { status: 500 });
+      try {
+          const { image, name } = await req.json();
+          if (image) {
+              const id = Date.now().toString();
+              // Database ထဲ သိမ်းမည်
+              await kv.set(["photos", id], { data: image, name: name, date: new Date().toLocaleString() });
+              return new Response(JSON.stringify({ status: "success" }), { headers: { "Content-Type": "application/json" } });
+          }
+      } catch (e) {
+          return new Response(JSON.stringify({ status: "error", msg: e.message }), { headers: { "Content-Type": "application/json" } });
       }
   }
 
-  // --- 2. VIEW IMAGE ---
-  if (url.pathname.startsWith("/img/")) {
-      const id = url.pathname.split("/")[2];
-      const entry = await kv.get(["gallery", id]);
-      if (entry.value) {
-          return new Response(entry.value as Uint8Array, {
-              headers: { "Content-Type": "image/jpeg", "Cache-Control": "max-age=3600" }
-          });
-      }
-      return new Response("Not Found", { status: 404 });
+  // --- 2. DELETE IMAGE ---
+  if (req.method === "POST" && url.pathname === "/delete") {
+      const { id } = await req.json();
+      await kv.delete(["photos", id]);
+      return new Response(JSON.stringify({ status: "success" }), { headers: { "Content-Type": "application/json" } });
   }
 
-  // --- 3. DELETE ---
-  if (url.pathname.startsWith("/delete/")) {
-      const id = url.pathname.split("/")[2];
-      await kv.delete(["gallery", id]);
-      return new Response(null, { status: 303, headers: { "Location": "/" } });
+  // --- 3. UI (GALLERY) ---
+  const photos = [];
+  const iter = kv.list({ prefix: ["photos"] }, { reverse: true });
+  for await (const entry of iter) {
+      const p = entry.value as any;
+      photos.push({ id: entry.key[1], ...p });
   }
-
-  // --- 4. UI ---
-  const images = [];
-  const iter = kv.list({ prefix: ["gallery"] }, { reverse: true });
-  for await (const entry of iter) images.push(entry.key[1]);
 
   return new Response(`
     <!DOCTYPE html>
@@ -92,36 +41,114 @@ serve(async (req) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Cloud Gallery</title>
+      <title>My Photo Storage</title>
       <script src="https://cdn.tailwindcss.com"></script>
       <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-      <style>body{background:#111827;color:white}.loader{border:3px solid #374151;border-top:3px solid #3b82f6;border-radius:50%;width:20px;height:20px;animation:spin 1s linear infinite;display:inline-block}@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
+      <style>body { background: #111827; color: white; font-family: sans-serif; }</style>
     </head>
-    <body class="p-4">
-      <div class="max-w-md mx-auto">
-        <h1 class="text-xl font-bold mb-4 text-blue-400 flex items-center gap-2"><i class="fas fa-images"></i> Unlimited Gallery</h1>
-
-        <form action="/upload" method="POST" enctype="multipart/form-data" class="mb-6 bg-gray-800 p-4 rounded-xl border border-gray-700" onsubmit="document.getElementById('btn').classList.add('opacity-50');document.getElementById('ld').classList.remove('hidden')">
-            <div class="flex gap-2">
-                <input type="file" name="photo" accept="image/*" required class="block w-full text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700">
-            </div>
-            <button id="btn" class="mt-3 w-full bg-gray-700 py-2 rounded font-bold hover:bg-gray-600 flex items-center justify-center gap-2">
-                <span>Upload Photo</span> <div id="ld" class="loader hidden"></div>
-            </button>
-        </form>
-
-        <div class="grid grid-cols-2 gap-3">
-            ${images.length === 0 ? '<p class="col-span-2 text-center text-gray-600 py-10">No photos yet</p>' : ''}
-            ${images.map(id => `
-                <div class="relative group bg-black rounded-lg overflow-hidden border border-gray-800">
-                    <a href="/img/${id}" target="_blank">
-                        <img src="/img/${id}" class="w-full h-32 object-cover opacity-90 group-hover:opacity-100 transition">
-                    </a>
-                    <a href="/delete/${id}" onclick="return confirm('Delete?')" class="absolute top-1 right-1 bg-red-600/80 text-white w-6 h-6 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition"><i class="fas fa-times text-xs"></i></a>
-                </div>
-            `).join('')}
-        </div>
+    <body class="p-6 max-w-2xl mx-auto">
+      
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-2xl font-bold text-blue-400"><i class="fas fa-images"></i> Cloud Gallery</h1>
+        <span class="text-xs text-gray-500">${photos.length} Photos</span>
       </div>
+
+      <div class="bg-gray-800 p-4 rounded-xl border border-gray-700 mb-8">
+          <input type="file" id="fileInput" accept="image/*" class="hidden" onchange="processAndUpload(this)">
+          <label for="fileInput" class="cursor-pointer flex flex-col items-center justify-center h-32 border-2 border-dashed border-gray-600 rounded-lg hover:border-blue-500 hover:bg-gray-700 transition">
+              <i class="fas fa-cloud-upload-alt text-3xl text-gray-400 mb-2"></i>
+              <span class="text-sm text-gray-300">Click to Upload Photo</span>
+              <span id="status" class="text-xs text-blue-400 mt-2 hidden">Compressing & Uploading...</span>
+          </label>
+      </div>
+
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-4">
+          ${photos.map(p => `
+              <div class="relative group bg-black rounded-lg overflow-hidden shadow-lg border border-gray-800">
+                  <img src="${p.data}" class="w-full h-40 object-cover" onclick="viewImage('${p.data}')">
+                  <div class="absolute bottom-0 left-0 right-0 bg-black/70 p-2 flex justify-between items-center">
+                      <span class="text-[10px] truncate w-20">${p.name}</span>
+                      <button onclick="deletePhoto('${p.id}')" class="text-red-400 hover:text-red-200"><i class="fas fa-trash"></i></button>
+                  </div>
+              </div>
+          `).join('')}
+      </div>
+
+      ${photos.length === 0 ? '<div class="text-center text-gray-600 mt-10">No photos saved yet.</div>' : ''}
+
+      <script>
+        // IMAGE COMPRESSION LOGIC (Client Side)
+        function processAndUpload(input) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const status = document.getElementById('status');
+                status.classList.remove('hidden');
+                status.innerText = "Processing: " + file.name;
+
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const img = new Image();
+                    img.src = e.target.result;
+                    img.onload = function() {
+                        const canvas = document.createElement('canvas');
+                        let width = img.width;
+                        let height = img.height;
+                        
+                        // 1. Resize if too big (Max width 800px)
+                        const MAX_WIDTH = 800;
+                        if (width > MAX_WIDTH) {
+                            height *= MAX_WIDTH / width;
+                            width = MAX_WIDTH;
+                        }
+                        
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+
+                        // 2. Reduce Quality to fit 64KB
+                        let quality = 0.7; // Start at 70%
+                        let dataUrl = canvas.toDataURL('image/jpeg', quality);
+                        
+                        // Loop to shrink size under 60KB
+                        while (dataUrl.length > 60000 && quality > 0.1) {
+                            quality -= 0.1;
+                            dataUrl = canvas.toDataURL('image/jpeg', quality);
+                        }
+
+                        upload(dataUrl, file.name);
+                    }
+                }
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function upload(base64, name) {
+            fetch('/upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: base64, name: name })
+            }).then(res => res.json()).then(d => {
+                if(d.status === 'success') location.reload();
+                else alert("Upload Failed");
+            });
+        }
+
+        function deletePhoto(id) {
+            if(confirm("Delete this photo?")) {
+                fetch('/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: id })
+                }).then(() => location.reload());
+            }
+        }
+
+        function viewImage(src) {
+            const w = window.open("");
+            w.document.write('<img src="'+src+'" style="width:100%">');
+        }
+      </script>
     </body>
     </html>
   `, { headers: { "content-type": "text/html" } });
