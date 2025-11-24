@@ -2,7 +2,8 @@
 const kv = await Deno.openKv();
 
 // --- CONFIG ---
-const ADMIN_PASS = "183110"; // ★ ဒီမှာ Password ပြောင်းပါ
+// Deno Env ထဲမှာ ADMIN_PASS မရှိရင် "1234" ကို သုံးမယ်
+const ADMIN_PASS = Deno.env.get("ADMIN_PASS") || "1234";
 
 // --- MAIN SERVER ---
 Deno.serve(async (req) => {
@@ -13,8 +14,7 @@ Deno.serve(async (req) => {
   // --- 1. LOGIN / LOGOUT ---
   if (req.method === "POST" && url.pathname === "/login") {
       const form = await req.formData();
-      const p = form.get("pass");
-      if (p === ADMIN_PASS) {
+      if (form.get("pass") === ADMIN_PASS) {
           const h = new Headers({ "Location": "/", "Set-Cookie": `auth=${ADMIN_PASS}; Path=/; HttpOnly; Max-Age=2592000` });
           return new Response(null, { status: 303, headers: h });
       }
@@ -29,20 +29,35 @@ Deno.serve(async (req) => {
   if (req.method === "POST") {
       if (!isAuth) return new Response("Unauthorized", { status: 401 });
 
+      // Save Image
       if (url.pathname === "/api/save") {
           try {
               const { image, name } = await req.json();
               if (image) {
                   const id = Date.now().toString();
-                  await kv.set(["photos", id], { data: image, name: name, date: new Date().toLocaleString() });
+                  // FIX: Myanmar Timezone
+                  const mmTime = new Date().toLocaleString("en-US", { timeZone: "Asia/Yangon" });
+                  await kv.set(["photos", id], { data: image, name: name, date: mmTime, hidden: false });
                   return new Response(JSON.stringify({ status: "success" }), { headers: { "Content-Type": "application/json" } });
               }
           } catch (e) { return new Response(JSON.stringify({ status: "error" }), { headers: { "Content-Type": "application/json" } }); }
       }
 
+      // Delete Image (Permanently)
       if (url.pathname === "/api/delete") {
           const { id } = await req.json();
           await kv.delete(["photos", id]);
+          return new Response(JSON.stringify({ status: "success" }), { headers: { "Content-Type": "application/json" } });
+      }
+
+      // Clear History List Only (Hide items, keep files)
+      if (url.pathname === "/api/clear_history") {
+          const iter = kv.list({ prefix: ["photos"] });
+          for await (const entry of iter) {
+              const val = entry.value as any;
+              // Set hidden flag to true
+              await kv.set(entry.key, { ...val, hidden: true });
+          }
           return new Response(JSON.stringify({ status: "success" }), { headers: { "Content-Type": "application/json" } });
       }
   }
@@ -61,7 +76,6 @@ Deno.serve(async (req) => {
   }
 
   // --- 4. VIEW IMAGE (Public Access) ---
-  // ဒီအပိုင်းကိုတော့ Password မခံပါဘူး (သူများကြည့်လို့ရအောင်)
   if (url.pathname.startsWith("/img/")) {
       const id = url.pathname.split("/")[2];
       const entry = await kv.get(["photos", id]);
@@ -79,7 +93,13 @@ Deno.serve(async (req) => {
   // --- 5. UI PAGE ---
   const photos = [];
   const iter = kv.list({ prefix: ["photos"] }, { reverse: true });
-  for await (const entry of iter) photos.push({ id: entry.key[1], ...entry.value as any });
+  for await (const entry of iter) {
+      const val = entry.value as any;
+      // Show only if NOT hidden
+      if (!val.hidden) {
+          photos.push({ id: entry.key[1], ...val });
+      }
+  }
 
   // LOGIN FORM UI
   if (!isAuth) {
@@ -89,7 +109,6 @@ Deno.serve(async (req) => {
             <h1 class="text-xl font-bold">Admin Access</h1>
             <input type="password" name="pass" placeholder="Password" class="bg-gray-700 border border-gray-600 p-2 rounded w-full text-center focus:outline-none focus:border-blue-500">
             <button class="bg-blue-600 w-full py-2 rounded font-bold hover:bg-blue-700">Login</button>
-            ${photos.length > 0 ? `<div class="pt-4 border-t border-gray-700 text-xs text-gray-400">${photos.length} photos stored publicly</div>` : ''}
          </form>
       </body></html>`, { headers: { "content-type": "text/html" } });
   }
@@ -104,7 +123,13 @@ Deno.serve(async (req) => {
       <title>Image Keeper (Admin)</title>
       <script src="https://cdn.tailwindcss.com"></script>
       <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-      <style>body { background: #111827; color: #e5e7eb; font-family: sans-serif; }</style>
+      <style>
+        body { background: #111827; color: #e5e7eb; font-family: sans-serif; }
+        .custom-scroll::-webkit-scrollbar { width: 6px; }
+        .custom-scroll::-webkit-scrollbar-track { background: #1f2937; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        .custom-scroll::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+      </style>
     </head>
     <body class="min-h-screen p-4 sm:p-8">
       <div class="max-w-3xl mx-auto">
@@ -135,22 +160,28 @@ Deno.serve(async (req) => {
             <div id="loading" class="hidden mt-4 text-center text-yellow-400 text-sm font-mono"><i class="fas fa-circle-notch fa-spin"></i> Processing...</div>
         </div>
 
-        <div class="space-y-3">
-            <div class="flex justify-between items-end border-b border-gray-700 pb-2 mb-4">
-                <h2 class="text-lg font-bold text-white">Saved Links (${photos.length})</h2>
+        <div>
+            <div class="flex justify-between items-center border-b border-gray-700 pb-2 mb-4">
+                <h2 class="text-lg font-bold text-white">History List (${photos.length})</h2>
+                ${photos.length > 0 ? `<button onclick="clearHistory()" class="text-xs text-orange-400 hover:text-orange-300 border border-orange-900 bg-orange-900/20 px-3 py-1 rounded transition">Clear List Only</button>` : ''}
             </div>
-            ${photos.map(p => `
-                <div class="bg-gray-800 p-3 rounded-lg border border-gray-700 flex items-center justify-between gap-3 group hover:border-blue-500/50 transition">
-                    <div class="flex items-center gap-3 overflow-hidden">
-                        <div class="w-10 h-10 rounded bg-gray-700 flex-shrink-0 flex items-center justify-center overflow-hidden"><img src="/img/${p.id}" class="w-full h-full object-cover"></div>
-                        <div class="min-w-0"><p class="text-sm font-bold text-white truncate">${p.name}</p><p class="text-[10px] text-gray-500">${p.date}</p></div>
-                    </div>
-                    <div class="flex gap-2 flex-shrink-0">
-                        <button onclick="copyLink('${url.origin}/img/${p.id}')" class="bg-gray-700 hover:bg-blue-600 text-white px-3 py-1.5 rounded text-xs font-bold transition"><i class="fas fa-copy"></i></button>
-                        <a href="/img/${p.id}" target="_blank" class="bg-gray-700 hover:bg-green-600 text-white px-3 py-1.5 rounded text-xs font-bold transition"><i class="fas fa-eye"></i></a>
-                        <button onclick="deleteImg('${p.id}')" class="bg-gray-700 hover:bg-red-600 text-white px-3 py-1.5 rounded text-xs font-bold transition"><i class="fas fa-trash"></i></button>
-                    </div>
-                </div>`).join('')}
+
+            <!-- Scrollable Container (Fixed Height) -->
+            <div class="space-y-3 max-h-[500px] overflow-y-auto custom-scroll pr-2">
+                ${photos.length === 0 ? '<div class="text-center text-gray-600 py-8">No images in history.</div>' : ''}
+                ${photos.map(p => `
+                    <div class="bg-gray-800 p-3 rounded-lg border border-gray-700 flex items-center justify-between gap-3 group hover:border-blue-500/50 transition">
+                        <div class="flex items-center gap-3 overflow-hidden">
+                            <div class="w-10 h-10 rounded bg-gray-700 flex-shrink-0 flex items-center justify-center overflow-hidden"><img src="/img/${p.id}" class="w-full h-full object-cover"></div>
+                            <div class="min-w-0"><p class="text-sm font-bold text-white truncate">${p.name}</p><p class="text-[10px] text-gray-500">${p.date}</p></div>
+                        </div>
+                        <div class="flex gap-2 flex-shrink-0">
+                            <button onclick="copyLink('${url.origin}/img/${p.id}')" class="bg-gray-700 hover:bg-blue-600 text-white px-3 py-1.5 rounded text-xs font-bold transition"><i class="fas fa-copy"></i></button>
+                            <a href="/img/${p.id}" target="_blank" class="bg-gray-700 hover:bg-green-600 text-white px-3 py-1.5 rounded text-xs font-bold transition"><i class="fas fa-eye"></i></a>
+                            <button onclick="deleteImg('${p.id}')" class="bg-gray-700 hover:bg-red-600 text-white px-3 py-1.5 rounded text-xs font-bold transition"><i class="fas fa-trash"></i></button>
+                        </div>
+                    </div>`).join('')}
+            </div>
         </div>
       </div>
       <script>
@@ -185,7 +216,16 @@ Deno.serve(async (req) => {
             }
             reader.readAsDataURL(file);
         }
-        function deleteImg(id) { if(confirm("Delete?")) fetch('/api/delete', { method: 'POST', body: JSON.stringify({ id }) }).then(() => location.reload()); }
+        // Permanently Delete One
+        function deleteImg(id) { if(confirm("Permanently delete this image?")) fetch('/api/delete', { method: 'POST', body: JSON.stringify({ id }) }).then(() => location.reload()); }
+        
+        // Hide All History (Keep Files)
+        function clearHistory() { 
+            if(confirm("Clear list only? (Files will remain accessible)")) {
+                fetch('/api/clear_history', { method: 'POST' }).then(() => location.reload()); 
+            }
+        }
+        
         function copyLink(txt) { navigator.clipboard.writeText(txt).then(() => alert("Link Copied!")); }
       </script>
     </body>
